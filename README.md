@@ -77,7 +77,8 @@ ros2 launch hikvision_driver hik_camera_component.launch.py container_name:=came
 1. **RViz 无图像**:
 * 请在 RViz 中打开 `Image` 面板，将 **Reliability Policy** 设置为 **`Best Effort`**（驱动采用此模式以确保实时性）。
 
-
+---
+基于 [hikvision_ros2_driver](https://github.com/sjtu-cyberc3/hikvision_ros2_driver) 的优秀工作，谨此致谢！🙏
 
 
 
