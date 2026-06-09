@@ -38,16 +38,12 @@ def generate_launch_description():
         package='hikvision_driver',
         executable='hikvision_driver_node',
         name='hikvision_driver_node',
-        namespace=namespace,
-        
+        namespace=namespace, # 依然保留 Namespace 以防冲突，但参数全从 YAML 读
         output='screen',
-        # 【核心修改】直接把全局参数文件路径喂给 parameters
-        parameters=[
-            LaunchConfiguration('config_file'), # 还是加载 YAML，但不用非得有 camera_name
-            {'camera_name': LaunchConfiguration('camera_name')} # 【核心修改】强制注入/覆盖
-        ]
+        # 【核心修改】只放 config_file，不要再做 {'camera_name': ...} 的手动注入了
+        parameters=[LaunchConfiguration('config_file')]
     )
-
+    
     # ==========================================
     # 4. 返回 LaunchDescription
     # ==========================================

@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
-    # # 相机唯一名称，用于枚举设备（需与 MVS 客户端中设置的设备用户定义名称一致）
-    # camera_name: "argus_camera"
+    # 相机唯一名称，用于枚举设备（需与 MVS 客户端中设置的设备用户定义名称一致）
+    camera_name: "argus_camera"
 
     # ROS2 坐标系 ID，推荐使用格式：[camera_name]_optical_frame
     frame_id: "front_camera_optical_frame"

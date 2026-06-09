@@ -8,6 +8,7 @@ from launch_ros.descriptions import ComposableNode
 
 def generate_launch_description():
     pkg_share_dir = get_package_share_directory('hikvision_driver')
+    # 默认指向包内的配置文件
     default_config_path = os.path.join(pkg_share_dir, 'config', 'camera_params.yaml')
 
     config_file_arg = DeclareLaunchArgument(
@@ -20,14 +21,13 @@ def generate_launch_description():
         'container_name', default_value='camera_container'
     )
 
-    # 【新增】加上 camera_name 参数，为了跟 yaml 和独立节点保持行为一致
     camera_name_arg = DeclareLaunchArgument(
         'camera_name', 
         default_value='front_camera',
-        description='Name used for the node namespace. Should match the camera_name inside YAML.'
+        description='Name used for the node namespace.'
     )
 
-    # 【新增】动态拼接命名空间，防止多台相机挂载在同一容器时发生重名冲突
+    # 动态构建命名空间
     namespace = ['/driver/hikvision/', LaunchConfiguration('camera_name')]
 
     load_driver_component = LoadComposableNodes(
@@ -37,10 +37,10 @@ def generate_launch_description():
                 package='hikvision_driver',
                 plugin='hikvision_driver::HikvisionDriver',
                 name='hikvision_driver_node',
-                namespace=namespace,  # <--- 使用拼接好的命名空间
+                namespace=namespace, 
                 parameters=[
-                    LaunchConfiguration('config_file'), # 还是加载 YAML，但不用非得有 camera_name
-                    {'camera_name': LaunchConfiguration('camera_name')} # 【核心修改】强制注入/覆盖
+                    LaunchConfiguration('config_file'), 
+                    {'camera_name': LaunchConfiguration('camera_name')} 
                 ],
                 extra_arguments=[{'use_intra_process_comms': True}]
             )
@@ -50,6 +50,6 @@ def generate_launch_description():
     return LaunchDescription([
         config_file_arg,
         container_name_arg,
-        camera_name_arg,  # <--- 不要忘记在这里返回
+        camera_name_arg,
         load_driver_component
     ])
