@@ -18,33 +18,38 @@ ament_auto_find_build_dependencies()
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 find_package(MVS REQUIRED)
 
+# --- 修改 1: 声明头文件安装规范 ---
+# 明确告诉 CMake 你的头文件在 include/hikvision_driver 中
+include_directories(include)
+
 # build components
 ament_auto_add_library(${PROJECT_NAME} SHARED
-  src/hikvision_ros2_driver.cpp
+  src/hikvision_driver.cpp
 )
-target_include_directories(${PROJECT_NAME} PUBLIC include)
+
+# 确保链接属性正确
+target_include_directories(${PROJECT_NAME} PUBLIC 
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
 target_include_directories(${PROJECT_NAME} PRIVATE ${MVS_INCLUDE_DIR})
 target_link_libraries(${PROJECT_NAME} ${MVS_LIBRARIES})
 
 # register components
 rclcpp_components_register_node(${PROJECT_NAME}
-  PLUGIN "hikvision_ros2_driver::HikvisionDriver"
+  PLUGIN "hikvision_driver::HikvisionDriver"
   EXECUTABLE ${PROJECT_NAME}_node
 )
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-ament_auto_package(INSTALL_TO_SHARE
-  launch
-  config
+# --- 修改 2: 启用 Scoped 模式并优化安装 ---
+ament_auto_package(
+  INSTALL_TO_SHARE launch config
+  USE_SCOPED_HEADER_INSTALL_DIR
 )
