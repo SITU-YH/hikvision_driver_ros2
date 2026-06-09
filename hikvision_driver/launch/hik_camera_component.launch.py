@@ -38,7 +38,10 @@ def generate_launch_description():
                 plugin='hikvision_driver::HikvisionDriver',
                 name='hikvision_driver_node',
                 namespace=namespace,  # <--- 使用拼接好的命名空间
-                parameters=[LaunchConfiguration('config_file')],
+                parameters=[
+                    LaunchConfiguration('config_file'), # 还是加载 YAML，但不用非得有 camera_name
+                    {'camera_name': LaunchConfiguration('camera_name')} # 【核心修改】强制注入/覆盖
+                ],
                 extra_arguments=[{'use_intra_process_comms': True}]
             )
         ]
