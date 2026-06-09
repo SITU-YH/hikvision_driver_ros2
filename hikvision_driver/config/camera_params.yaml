@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
     # 相机唯一名称，用于枚举设备（需与 MVS 客户端中设置的设备用户定义名称一致）
-    camera_name: "front_camera"
+    camera_name: "argus_camera"
 
     # ROS2 坐标系 ID，推荐使用格式：[camera_name]_optical_frame
     frame_id: "front_camera_optical_frame"
@@ -13,7 +13,7 @@
 
     # 相机标定文件路径 (URI格式)
 
-    camera_info_url: "package://hikvision_ros2_driver/config/camera_info.yaml"
+    camera_info_url: "package://hikvision_driver/config/camera_info.yaml"
 
     # 初始曝光时间 (单位: 微秒 us)
     # 范围由具体相机硬件决定，通常为 20.0 - 500000.0

@@ -37,7 +37,7 @@ target_link_libraries(${PROJECT_NAME} ${MVS_LIBRARIES})
 
 # register components
 rclcpp_components_register_node(${PROJECT_NAME}
-  PLUGIN "hikvision_ros2_driver::HikvisionDriver"
+  PLUGIN "hikvision_driver::HikvisionDriver"
   EXECUTABLE ${PROJECT_NAME}_node
 )
 
