@@ -26,8 +26,7 @@
 
 ```bash
 cd ~/your_ws/src
-# 将本仓库代码放入此处，或者直接 clone
-# git clone <your_repo_url>
+git clone https://github.com/SITU-YH/hikvision_driver_ros2.git
 
 cd ~/your_ws
 # 同时编译两个包
