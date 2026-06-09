@@ -42,7 +42,7 @@ source install/setup.bash
 ### 1. 独立运行（用于单相机调试）
 
 ```bash
-ros2 launch hikvision_driver hik_camera.launch.py camera_name:=argus_camera
+ros2 launch hikvision_driver hik_camera.launch.py 
 
 ```
 
