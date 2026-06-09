@@ -17,6 +17,10 @@
 
 * **系统**: Ubuntu 22.04 (ROS2 Humble) 或更高版本。
 * **依赖**: 请确保已安装海康 MVS Linux SDK（通常位于 `/opt/MVS`）。
+* **ROS 2 依赖包**: 
+```bash
+sudo apt install ros-humble-image-transport ros-humble-camera-info-manager
+```
 
 ---
 
