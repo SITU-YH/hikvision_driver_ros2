@@ -1,8 +1,4 @@
-既然你的 `hikvision_interface` 和 `hikvision_driver` 放在同一个代码仓库里，你需要一个能够从全局角度概括整个工程的 `README.md`。
 
-这份 README 放在你仓库的根目录（即包含这两个包文件夹的那一层）是最合适的。
-
----
 
 # Hikvision Camera ROS2 
 
