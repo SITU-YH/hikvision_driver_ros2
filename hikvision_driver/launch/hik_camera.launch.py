@@ -1,54 +1,56 @@
 import os
+import yaml  # 导入 YAML 解析库
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+def launch_setup(context, *args, **kwargs):
+    # 1. 将 LaunchConfiguration 转换成真实的字符串文件路径
+    config_file_path = LaunchConfiguration('config_file').perform(context)
+
+    # 2. 用 Python 打开并解析这个 YAML 文件
+    with open(config_file_path, 'r') as f:
+        yaml_data = yaml.safe_load(f)
+
+    # 3. 提前从 YAML 提取 camera_name
+    try:
+        camera_name = yaml_data['/**']['ros__parameters']['camera_name']
+    except KeyError:
+        print(f"[ERROR] 无法在 {config_file_path} 中找到 camera_name! 将使用 fallback_camera")
+        camera_name = 'fallback_camera'
+
+    # 4. 动态构建命名空间 (完全听命于 YAML 里的名字)
+    namespace = ['/driver/hikvision/', camera_name]
+
+    # 5. 定义要启动的独立 Node
+    hik_camera_node = Node(
+        package='hikvision_driver',
+        executable='hikvision_driver_node',
+        name='hikvision_driver_node',
+        namespace=namespace, 
+        output='screen',
+        # 【终极黑盒】：把文件路径直接喂给节点，不再做任何参数注入
+        parameters=[config_file_path]
+    )
+    
+    return [hik_camera_node]
+
+
 def generate_launch_description():
-    # ==========================================
-    # 1. 定位默认的 YAML 参数文件路径
-    # ==========================================
     pkg_share_dir = get_package_share_directory('hikvision_driver')
     default_config_path = os.path.join(pkg_share_dir, 'config', 'camera_params.yaml')
 
-    # ==========================================
-    # 2. 声明 Launch 参数 (允许从命令行覆盖 YAML 配置)
-    # ==========================================
+    # 现在 Launch 只需要这一个参数！camera_name 参数已被彻底删除。
     config_file_arg = DeclareLaunchArgument(
         'config_file',
         default_value=default_config_path,
         description='Absolute path to the camera parameter YAML file.'
     )
 
-    # 依然保留 camera_name 参数，用于动态决定节点的命名空间 (Namespace)
-    camera_name_arg = DeclareLaunchArgument(
-        'camera_name', 
-        default_value='front_camera',
-        description='Name used for the node namespace. Should match the camera_name inside YAML.'
-    )
-
-    # ==========================================
-    # 3. 定义要启动的独立 Node
-    # ==========================================
-    # 动态拼接命名空间，例如: /driver/hikvision/front_camera
-    namespace = ['/driver/hikvision/', LaunchConfiguration('camera_name')]
-
-    hik_camera_node = Node(
-        package='hikvision_driver',
-        executable='hikvision_driver_node',
-        name='hikvision_driver_node',
-        namespace=namespace, # 依然保留 Namespace 以防冲突，但参数全从 YAML 读
-        output='screen',
-        # 【核心修改】只放 config_file，不要再做 {'camera_name': ...} 的手动注入了
-        parameters=[LaunchConfiguration('config_file')]
-    )
-    
-    # ==========================================
-    # 4. 返回 LaunchDescription
-    # ==========================================
+    # 使用 OpaqueFunction 在节点启动前执行文件读取逻辑
     return LaunchDescription([
         config_file_arg,
-        camera_name_arg,
-        hik_camera_node
+        OpaqueFunction(function=launch_setup)
     ])
