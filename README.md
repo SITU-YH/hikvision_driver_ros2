@@ -1,6 +1,6 @@
 
 
-# Hikvision Camera ROS2 
+# Hikvision Driver ROS2 
 
 本仓库包含了一套完整的海康威视（Hikvision）工业相机 ROS2 驱动解决方案，采用了模块化设计，将数据接口与驱动实现分离。
 
