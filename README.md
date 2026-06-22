@@ -19,7 +19,11 @@
 * **依赖**: 请确保已安装海康 MVS Linux SDK（通常位于 `/opt/MVS`）。
 * **ROS 2 依赖包**: 
 ```bash
+# ROS2 Humble
 sudo apt install ros-humble-image-transport ros-humble-camera-info-manager
+
+#ROS2 Jazzy
+sudo apt install ros-jazzy-image-transport ros-jazzy-camera-info-manager
 ```
 
 ---
