@@ -165,11 +165,8 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
     // 也可指定 "RGB8" / "BGR8" / "Mono8" / "BayerRG8" / "BayerBG8" / "BayerGR8" / "BayerGB8"。
     declare_parameter<std::string>("pixel_format", "RGB8");
 
-    // 触发模式：设为 true 时相机切为 Software 触发，每次需调用 TriggerSoftware 才出图
-    declare_parameter<bool>("trigger_mode", false);
-
-    // 图像数据流使用 SensorDataQoS（BEST_EFFORT），避免大图像在 RELIABLE 下阻塞/重传堆积。
-    auto qos = rclcpp::SensorDataQoS();
+    // 使用 RELIABLE QoS，确保与 rviz2 等默认订阅者兼容
+    auto qos = rclcpp::SensorDataQoS().reliable();
     pImpl->img_pub = image_transport::create_publisher(this, "image_raw", qos.get_rmw_qos_profile());
     pImpl->p_info_pub = create_publisher<HikImageInfo>("info", qos);
 
@@ -233,14 +230,11 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
             MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "BalanceWhiteAuto", 2); // 自动白平衡
 
             // ==========================================================
-            // 触发模式配置
+            // 触发模式 — 硬编码为 Software Trigger
             // ==========================================================
-            bool trigger_mode = get_parameter("trigger_mode").as_bool();
-            if (trigger_mode) {
-                MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerMode", 1);   // TriggerMode = On
-                MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerSource", 0); // TriggerSource = Software
-                RCLCPP_INFO(logger, "Trigger mode enabled (TriggerMode=On, TriggerSource=Software)");
-            }
+            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerMode", 1);   // TriggerMode = On
+            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerSource", 0); // TriggerSource = Software
+            RCLCPP_INFO(logger, "Trigger mode hardcoded ON (TriggerMode=On, TriggerSource=Software)");
 
             // TriggerSoftware 服务：每次调用触发一次相机曝光
             pImpl->trigger_service_ = this->create_service<std_srvs::srv::Trigger>(
