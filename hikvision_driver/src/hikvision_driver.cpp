@@ -3,6 +3,7 @@
 // std
 #include <cstring>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 
 // ros
@@ -15,6 +16,7 @@
 // camera info
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <camera_info_manager/camera_info_manager.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 // 用于构造函数：失败时抛出异常打断流程，防止传入空指针
 #define MV_CHECK_THROW(logger, func, ...)                                      \
@@ -54,6 +56,9 @@ struct HikvisionDriver::Impl {
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_pub;
     std::shared_ptr<camera_info_manager::CameraInfoManager> cinfo_manager;
     std::string frame_id;
+
+    // TriggerSoftware 服务
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_service_;
 };
 
 void HikvisionDriver::Impl::image_callback_ex(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo, void *pUser) {
@@ -160,6 +165,9 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
     // 也可指定 "RGB8" / "BGR8" / "Mono8" / "BayerRG8" / "BayerBG8" / "BayerGR8" / "BayerGB8"。
     declare_parameter<std::string>("pixel_format", "RGB8");
 
+    // 触发模式：设为 true 时相机切为 Software 触发，每次需调用 TriggerSoftware 才出图
+    declare_parameter<bool>("trigger_mode", false);
+
     // 图像数据流使用 SensorDataQoS（BEST_EFFORT），避免大图像在 RELIABLE 下阻塞/重传堆积。
     auto qos = rclcpp::SensorDataQoS();
     pImpl->img_pub = image_transport::create_publisher(this, "image_raw", qos.get_rmw_qos_profile());
@@ -223,6 +231,35 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
             MV_CHECK_THROW(logger, MV_CC_SetFloatValue, pImpl->handle, "ExposureTime", static_cast<float>(init_exposure));
             MV_CHECK_THROW(logger, MV_CC_SetFloatValue, pImpl->handle, "Gain", static_cast<float>(init_gain));
             MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "BalanceWhiteAuto", 2); // 自动白平衡
+
+            // ==========================================================
+            // 触发模式配置
+            // ==========================================================
+            bool trigger_mode = get_parameter("trigger_mode").as_bool();
+            if (trigger_mode) {
+                MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerMode", 1);   // TriggerMode = On
+                MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerSource", 0); // TriggerSource = Software
+                RCLCPP_INFO(logger, "Trigger mode enabled (TriggerMode=On, TriggerSource=Software)");
+            }
+
+            // TriggerSoftware 服务：每次调用触发一次相机曝光
+            pImpl->trigger_service_ = this->create_service<std_srvs::srv::Trigger>(
+                "trigger_software",
+                [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
+                       std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+                    int nRet = MV_CC_SetCommandValue(pImpl->handle, "TriggerSoftware");
+                    if (nRet == MV_OK) {
+                        res->success = true;
+                        res->message = "ok";
+                    } else {
+                        res->success = false;
+                        res->message = "TriggerSoftware failed: 0x" +
+                            (std::ostringstream{} << std::hex << nRet).str();
+                        RCLCPP_WARN(this->get_logger(), "TriggerSoftware failed: 0x%X", nRet);
+                    }
+                });
+            RCLCPP_INFO(logger, "TriggerSoftware service ready at '%s'",
+                       pImpl->trigger_service_->get_service_name());
 
             // 新增：注册动态参数监听回调（实现实时滑块控制）
             pImpl->param_callback_handle = this->add_on_set_parameters_callback(
