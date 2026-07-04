@@ -1,6 +1,7 @@
 #include "hikvision_driver/hikvision_driver.hpp"
 
 // std
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <sstream>
@@ -59,13 +60,69 @@ struct HikvisionDriver::Impl {
 
     // TriggerSoftware 服务
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_service_;
+
+    // PTP/ChunkData 延迟测量：记录最近一次 TriggerSoftware 时的 ROS 2 系统时间（纳秒）
+    std::atomic<uint64_t> last_trigger_send_ns_{0};
 };
 
 void HikvisionDriver::Impl::image_callback_ex(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo, void *pUser) {
     auto node = reinterpret_cast<HikvisionDriver *>(pUser);
 
-    uint64_t dev_stamp = (uint64_t)pFrameInfo->nDevTimeStampHigh << 32ull | (uint64_t)pFrameInfo->nDevTimeStampLow;
+    // ---- PTP/ChunkData 硬件时间戳: T_exposure (相机端) ----
+    // nDevTimeStamp = 相机硬件的 64 位 libre 运行计数器，tick 精度，单调递增
+    // 它未与 PTP/系统时间绝对同步，但作为相对计时基准极其精确 (通常 <1μs jitter)
+    // 策略：校准 epoch_offset = 系统时间 - 相机时间，用于将相机时间映射到系统时间域
+    uint64_t dev_stamp = (uint64_t)pFrameInfo->nDevTimeStampHigh << 32ull
+                        | (uint64_t)pFrameInfo->nDevTimeStampLow;
+    // ChunkData Timestamp (如果 PTP 已同步，此处会是大数值；未同步时也是相机本地时间)
+    uint64_t chunk_sec = pFrameInfo->nSecondCount;
+    uint64_t chunk_cyc = pFrameInfo->nCycleCount;
+    uint64_t chunk_off = pFrameInfo->nCycleOffset;
+
+    // 动态校准: 使用 nDevTimeStamp，通过 epoch_offset 映射到系统时间
+    // epoch_offset = system_time_at_callback - dev_stamp (在每次回调中更新，使用 EWMA 平滑)
+    static int64_t epoch_offset_ns = 0;
+    static bool epoch_calibrated = false;
+    auto now_ns_for_calib = node->now().nanoseconds();
+    if (!epoch_calibrated || dev_stamp > 0) {
+        int64_t new_offset = (int64_t)((uint64_t)now_ns_for_calib - dev_stamp);
+        if (!epoch_calibrated) {
+            epoch_offset_ns = new_offset;
+            epoch_calibrated = true;
+            RCLCPP_INFO(node->get_logger(),
+                "[CALIB] epoch_offset = %ld ns (system_now=%lu, cam_tick=%lu)",
+                epoch_offset_ns, now_ns_for_calib, dev_stamp);
+        } else {
+            // EWMA 平滑 offset，跟踪可能的时钟漂移
+            epoch_offset_ns = (int64_t)(0.2 * (double)new_offset + 0.8 * (double)epoch_offset_ns);
+        }
+    }
+    // T_exposure 在系统时间域中的估计值
+    uint64_t dev_stamp_ns = (uint64_t)((int64_t)dev_stamp + epoch_offset_ns);
     uint64_t host_stamp = pFrameInfo->nHostTimeStamp;
+
+    // ---- PTP/ChunkData 延迟测量诊断 ----
+    // 每 10 帧打印一次时间戳对比，避免刷屏
+    static uint32_t diag_frame_cnt = 0;
+    if (++diag_frame_cnt % 10 == 0) {
+        auto now_ns = node->now().nanoseconds();
+        RCLCPP_INFO(node->get_logger(),
+            "[TS-DIAG] frame#%d | dev_raw=%lu ns | calib=%ld ns | dev-vs-now offset=%ld ns | "
+            "Chunk: sec=%lu cyc=%lu off=%lu | epoch_offset=%ld ns",
+            pFrameInfo->nFrameNum, dev_stamp, dev_stamp_ns,
+            (int64_t)(dev_stamp_ns - (uint64_t)now_ns),
+            chunk_sec, chunk_cyc, chunk_off,
+            epoch_offset_ns);
+    }
+
+    // ---- PTP/ChunkData 延迟测量: 计算 ΔT = T_exposure - T_send ----
+    uint64_t t_send_ns = node->pImpl->last_trigger_send_ns_.load();
+    if (t_send_ns > 0 && dev_stamp_ns > 0) {
+        int64_t delta_ns = (int64_t)(dev_stamp_ns - t_send_ns);
+        RCLCPP_INFO(node->get_logger(),
+            "[LATENCY] T_send=%lu T_exposure=%lu ΔT=%ld ns (%.1f μs)",
+            t_send_ns, dev_stamp_ns, delta_ns, delta_ns / 1000.0);
+    }
 
     auto p_img_msg = std::make_unique<sensor_msgs::msg::Image>();
     if (pFrameInfo->nFrameLen > p_img_msg->data.max_size()) {
@@ -116,8 +173,8 @@ void HikvisionDriver::Impl::image_callback_ex(unsigned char *pData, MV_FRAME_OUT
     p_info_msg->header.frame_id = node->pImpl->camera_name;
     p_info_msg->header.stamp.nanosec = host_stamp % 1000ull * 1000000ull;
     p_info_msg->header.stamp.sec = host_stamp / 1000ull;
-    p_info_msg->dev_stamp.nanosec = dev_stamp % 1000000000ull;
-    p_info_msg->dev_stamp.sec = dev_stamp / 1000000000ull;
+    p_info_msg->dev_stamp.nanosec = dev_stamp_ns % 1000000000ull;
+    p_info_msg->dev_stamp.sec = dev_stamp_ns / 1000000000ull;
     p_info_msg->frame_num = pFrameInfo->nFrameNum;
     p_info_msg->gain = pFrameInfo->fGain;
     p_info_msg->exposure = pFrameInfo->fExposureTime;
@@ -204,6 +261,37 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
             MV_CHECK_THROW(logger, MV_CC_CreateHandle, &pImpl->handle, pDeviceInfo);
             MV_CHECK_THROW(logger, MV_CC_OpenDevice, pImpl->handle);
 
+            // ---- PTP/ChunkData 延迟测量: 启用 IEEE 1588 (PTP) 主时钟同步 ----
+            // 如果相机不支持此特性，只打印警告，不中断流程
+            {
+                int nRet = MV_CC_SetBoolValue(pImpl->handle, "GevIEEE1588", true);
+                if (MV_OK == nRet) {
+                    RCLCPP_INFO(logger, "GevIEEE1588 (PTP) enabled — camera clock will sync to host via ptp4l");
+                } else {
+                    RCLCPP_WARN(logger, "GevIEEE1588 not supported or failed (0x%X); PTP sync may need manual camera-side config", nRet);
+                }
+            }
+
+            // ---- PTP/ChunkData 延迟测量: 启用 ChunkData (Exposure + Timestamp) ----
+            {
+                int nRet = MV_CC_SetBoolValue(pImpl->handle, "ChunkModeActive", true);
+                if (MV_OK != nRet) {
+                    RCLCPP_WARN(logger, "ChunkModeActive failed (0x%X) — camera may not support ChunkData", nRet);
+                } else {
+                    // Chunk 1: Exposure time
+                    MV_CC_SetEnumValueByString(pImpl->handle, "ChunkSelector", "Exposure");
+                    MV_CC_SetBoolValue(pImpl->handle, "ChunkEnable", true);
+                    // Chunk 2: Timestamp (曝光时刻的时间戳)
+                    MV_CC_SetEnumValueByString(pImpl->handle, "ChunkSelector", "Timestamp");
+                    nRet = MV_CC_SetBoolValue(pImpl->handle, "ChunkEnable", true);
+                    if (MV_OK == nRet) {
+                        RCLCPP_INFO(logger, "ChunkData enabled: Exposure + Timestamp chunks active");
+                    } else {
+                        RCLCPP_WARN(logger, "ChunkData Timestamp enable failed (0x%X)", nRet);
+                    }
+                }
+            }
+
             // 像素格式：根据 pixel_format 参数设置；"Keep" 时保持相机当前格式。
             std::string pixel_format = get_parameter("pixel_format").as_string();
             if (pixel_format != "Keep") {
@@ -241,10 +329,16 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
                 "trigger_software",
                 [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
                        std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+                    // ---- PTP 延迟测量: 记录 T_send ----
+                    auto t_send = this->now();
+                    uint64_t t_send_ns = static_cast<uint64_t>(t_send.nanoseconds());
+                    pImpl->last_trigger_send_ns_.store(t_send_ns);
+
                     int nRet = MV_CC_SetCommandValue(pImpl->handle, "TriggerSoftware");
                     if (nRet == MV_OK) {
                         res->success = true;
-                        res->message = "ok";
+                        // 将 T_send 编码到 message 中，方便调用方解析
+                        res->message = "ok|" + std::to_string(t_send_ns);
                     } else {
                         res->success = false;
                         res->message = "TriggerSoftware failed: 0x" +
