@@ -233,7 +233,7 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
             // 触发模式 — 硬编码为 Software Trigger
             // ==========================================================
             MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerMode", 1);   // TriggerMode = On
-            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerSource", 0); // TriggerSource = Software
+            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerSource", 7); // TriggerSource = Software
             RCLCPP_INFO(logger, "Trigger mode hardcoded ON (TriggerMode=On, TriggerSource=Software)");
 
             // TriggerSoftware 服务：每次调用触发一次相机曝光
