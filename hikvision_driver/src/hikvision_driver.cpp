@@ -1,48 +1,95 @@
 #include "hikvision_driver/hikvision_driver.hpp"
 
-// std
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
-// ros
+#include <camera_info_manager/camera_info_manager.hpp>
 #include <hikvision_interface/msg/hik_image_info.hpp>
+#include <hikvision_interface/srv/trigger_software_stamped.hpp>
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/image_encodings.hpp>
-
-// hikvision sdk
-#include <MvCameraControl.h>
-// camera info
 #include <sensor_msgs/msg/camera_info.hpp>
-#include <camera_info_manager/camera_info_manager.hpp>
-#include <std_srvs/srv/trigger.hpp>
 
-// 用于构造函数：失败时抛出异常打断流程，防止传入空指针
-#define MV_CHECK_THROW(logger, func, ...)                                      \
-    do {                                                                       \
-        int nRet = func(__VA_ARGS__);                                          \
-        if (MV_OK != nRet) {                                                   \
-            RCLCPP_ERROR(logger, "hikvision sdk error: " #func " = 0x%X", nRet); \
-            throw std::runtime_error("Hikvision SDK init error: " #func);      \
-        }                                                                      \
+#include <MvCameraControl.h>
+
+#define MV_CHECK_THROW(logger, func, ...)                                          \
+    do {                                                                           \
+        int nRet = func(__VA_ARGS__);                                              \
+        if (MV_OK != nRet) {                                                       \
+            RCLCPP_ERROR(logger, "hikvision sdk error: " #func " = 0x%X", nRet);  \
+            throw std::runtime_error("Hikvision SDK init error: " #func);          \
+        }                                                                          \
     } while (0)
 
-// 用于析构函数：失败时只打印警告（C++析构函数中严禁抛出异常）
-#define MV_CHECK_WARN(logger, func, ...)                                       \
-    do {                                                                       \
-        int nRet = func(__VA_ARGS__);                                          \
-        if (MV_OK != nRet) {                                                   \
+#define MV_CHECK_WARN(logger, func, ...)                                           \
+    do {                                                                           \
+        int nRet = func(__VA_ARGS__);                                              \
+        if (MV_OK != nRet) {                                                       \
             RCLCPP_WARN(logger, "hikvision sdk warning: " #func " = 0x%X", nRet); \
-        }                                                                      \
+        }                                                                          \
     } while (0)
 
 using hikvision_interface::msg::HikImageInfo;
+using hikvision_interface::srv::TriggerSoftwareStamped;
+
+namespace {
+
+builtin_interfaces::msg::Time ToBuiltinTime(uint64_t ns) {
+    builtin_interfaces::msg::Time stamp;
+    stamp.sec = static_cast<int32_t>(ns / 1000000000ull);
+    stamp.nanosec = static_cast<uint32_t>(ns % 1000000000ull);
+    return stamp;
+}
+
+uint64_t ScaleTicksToNs(uint64_t ticks, uint64_t tick_frequency) {
+    if (tick_frequency == 0) {
+        return 0;
+    }
+    __int128 scaled = static_cast<__int128>(ticks) * 1000000000ll;
+    return static_cast<uint64_t>(scaled / tick_frequency);
+}
+
+const char *PtpStatusToString(unsigned int status) {
+    switch (status) {
+        case 0: return "Initializing";
+        case 1: return "Faulty";
+        case 2: return "Disabled";
+        case 3: return "Listening";
+        case 4: return "PreMaster";
+        case 5: return "Master";
+        case 6: return "Passive";
+        case 7: return "Uncalibrated";
+        case 8: return "Slave";
+        default: return "Unknown";
+    }
+}
+
+bool IsPtpLocked(unsigned int status) {
+    return status == 8 || status == 5;
+}
+
+}  // namespace
 
 namespace hikvision_driver {
 
 struct HikvisionDriver::Impl {
+    struct PendingTrigger {
+        uint64_t trigger_seq = 0;
+        uint64_t t_app_issue_ns = 0;
+        uint64_t t_drv_before_ns = 0;
+        uint64_t t_drv_after_ns = 0;
+    };
+
     std::unique_ptr<rclcpp::Logger> logger;
 
     void *handle = nullptr;
@@ -50,78 +97,117 @@ struct HikvisionDriver::Impl {
     image_transport::Publisher img_pub;
     std::shared_ptr<rclcpp::Publisher<HikImageInfo>> p_info_pub;
     static void image_callback_ex(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo, void *pUser);
-    
-    // 新增：用于维持动态参数回调生命周期的句柄
+
     rclcpp::Node::OnSetParametersCallbackHandle::SharedPtr param_callback_handle;
 
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_pub;
     std::shared_ptr<camera_info_manager::CameraInfoManager> cinfo_manager;
     std::string frame_id;
 
-    // TriggerSoftware 服务
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_service_;
+    rclcpp::Service<TriggerSoftwareStamped>::SharedPtr trigger_service_;
 
-    // PTP/ChunkData 延迟测量：记录最近一次 TriggerSoftware 时的 ROS 2 系统时间（纳秒）
-    std::atomic<uint64_t> last_trigger_send_ns_{0};
+    std::mutex trigger_mtx_;
+    std::deque<PendingTrigger> pending_triggers_;
+    uint64_t next_trigger_seq_ = 1;
+
+    std::atomic<unsigned int> ptp_status_{2};
+    std::atomic<uint64_t> timestamp_tick_frequency_{0};
+    std::atomic<uint32_t> frame_counter_{0};
+    std::atomic<int64_t> ptp_to_unix_offset_ns_{0};
+    std::atomic<bool> ptp_offset_ready_{false};
+
+    bool query_ptp_status(unsigned int &status) const {
+        MVCC_ENUMVALUE value;
+        std::memset(&value, 0, sizeof(value));
+        int ret = MV_CC_GetEnumValue(handle, "GevIEEE1588Status", &value);
+        if (ret != MV_OK) {
+            return false;
+        }
+        status = value.nCurValue;
+        return true;
+    }
+
+    bool query_timestamp_tick_frequency(uint64_t &tick_frequency) const {
+        MVCC_INTVALUE_EX value;
+        std::memset(&value, 0, sizeof(value));
+        int ret = MV_CC_GetIntValueEx(handle, "GevTimestampTickFrequency", &value);
+        if (ret != MV_OK || value.nCurValue <= 0) {
+            return false;
+        }
+        tick_frequency = static_cast<uint64_t>(value.nCurValue);
+        return true;
+    }
+
+    void refresh_ptp_state(const rclcpp::Logger &node_logger, bool force_log = false) {
+        unsigned int queried_status = ptp_status_.load();
+        if (query_ptp_status(queried_status)) {
+            unsigned int previous = ptp_status_.exchange(queried_status);
+            if (force_log || previous != queried_status) {
+                RCLCPP_INFO(node_logger, "PTP status = %s (%u)", PtpStatusToString(queried_status), queried_status);
+            }
+        } else if (force_log) {
+            RCLCPP_WARN(node_logger, "Failed to query GevIEEE1588Status; PTP lock state unknown");
+        }
+
+        uint64_t tick_frequency = 0;
+        if (query_timestamp_tick_frequency(tick_frequency)) {
+            uint64_t previous = timestamp_tick_frequency_.exchange(tick_frequency);
+            if (force_log || previous != tick_frequency) {
+                RCLCPP_INFO(node_logger, "Camera timestamp tick frequency = %lu Hz", tick_frequency);
+            }
+        } else if (force_log) {
+            RCLCPP_WARN(node_logger, "Failed to query GevTimestampTickFrequency");
+        }
+    }
 };
 
 void HikvisionDriver::Impl::image_callback_ex(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo, void *pUser) {
     auto node = reinterpret_cast<HikvisionDriver *>(pUser);
+    auto &impl = *node->pImpl;
 
-    // ---- PTP/ChunkData 硬件时间戳: T_exposure (相机端) ----
-    // nDevTimeStamp = 相机硬件的 64 位 libre 运行计数器，tick 精度，单调递增
-    // 它未与 PTP/系统时间绝对同步，但作为相对计时基准极其精确 (通常 <1μs jitter)
-    // 策略：校准 epoch_offset = 系统时间 - 相机时间，用于将相机时间映射到系统时间域
-    uint64_t dev_stamp = (uint64_t)pFrameInfo->nDevTimeStampHigh << 32ull
-                        | (uint64_t)pFrameInfo->nDevTimeStampLow;
-    // ChunkData Timestamp (如果 PTP 已同步，此处会是大数值；未同步时也是相机本地时间)
-    uint64_t chunk_sec = pFrameInfo->nSecondCount;
-    uint64_t chunk_cyc = pFrameInfo->nCycleCount;
-    uint64_t chunk_off = pFrameInfo->nCycleOffset;
+    uint32_t frame_counter = impl.frame_counter_.fetch_add(1) + 1;
+    if (frame_counter == 1 || frame_counter % 60 == 0) {
+        impl.refresh_ptp_state(node->get_logger(), frame_counter == 1);
+    }
 
-    // 动态校准: 使用 nDevTimeStamp，通过 epoch_offset 映射到系统时间
-    // epoch_offset = system_time_at_callback - dev_stamp (在每次回调中更新，使用 EWMA 平滑)
-    static int64_t epoch_offset_ns = 0;
-    static bool epoch_calibrated = false;
-    auto now_ns_for_calib = node->now().nanoseconds();
-    if (!epoch_calibrated || dev_stamp > 0) {
-        int64_t new_offset = (int64_t)((uint64_t)now_ns_for_calib - dev_stamp);
-        if (!epoch_calibrated) {
-            epoch_offset_ns = new_offset;
-            epoch_calibrated = true;
-            RCLCPP_INFO(node->get_logger(),
-                "[CALIB] epoch_offset = %ld ns (system_now=%lu, cam_tick=%lu)",
-                epoch_offset_ns, now_ns_for_calib, dev_stamp);
-        } else {
-            // EWMA 平滑 offset，跟踪可能的时钟漂移
-            epoch_offset_ns = (int64_t)(0.2 * (double)new_offset + 0.8 * (double)epoch_offset_ns);
+    const uint64_t dev_stamp_ticks = (static_cast<uint64_t>(pFrameInfo->nDevTimeStampHigh) << 32ull) |
+                                     static_cast<uint64_t>(pFrameInfo->nDevTimeStampLow);
+    const uint64_t host_stamp = static_cast<uint64_t>(pFrameInfo->nHostTimeStamp);
+    const uint64_t tick_frequency = impl.timestamp_tick_frequency_.load();
+    const unsigned int ptp_status = impl.ptp_status_.load();
+    const bool ptp_locked = IsPtpLocked(ptp_status);
+
+    uint64_t exposure_ns = 0;
+    bool ptp_time_valid = false;
+    if (ptp_locked && tick_frequency > 0 && dev_stamp_ticks > 0) {
+        int64_t raw_ns = static_cast<int64_t>(ScaleTicksToNs(dev_stamp_ticks, tick_frequency));
+        if (!impl.ptp_offset_ready_.load()) {
+            int64_t host_ns = static_cast<int64_t>(host_stamp) * 1000000ll;
+            int64_t offset = host_ns - raw_ns;
+            impl.ptp_to_unix_offset_ns_.store(offset);
+            impl.ptp_offset_ready_.store(true);
+            RCLCPP_INFO(node->get_logger(), "PTP epoch offset = %ld ns (%.3f s)", offset, offset / 1e9);
+        }
+        exposure_ns = static_cast<uint64_t>(raw_ns + impl.ptp_to_unix_offset_ns_.load());
+        ptp_time_valid = true;
+    }
+
+    Impl::PendingTrigger matched_trigger;
+    bool has_matched_trigger = false;
+    {
+        std::lock_guard<std::mutex> lk(impl.trigger_mtx_);
+        if (!impl.pending_triggers_.empty()) {
+            matched_trigger = impl.pending_triggers_.front();
+            impl.pending_triggers_.pop_front();
+            has_matched_trigger = true;
         }
     }
-    // T_exposure 在系统时间域中的估计值
-    uint64_t dev_stamp_ns = (uint64_t)((int64_t)dev_stamp + epoch_offset_ns);
-    uint64_t host_stamp = pFrameInfo->nHostTimeStamp;
 
-    // ---- PTP/ChunkData 延迟测量诊断 ----
-    // 每 10 帧打印一次时间戳对比，避免刷屏
-    static uint32_t diag_frame_cnt = 0;
-    if (++diag_frame_cnt % 10 == 0) {
-        auto now_ns = node->now().nanoseconds();
-        RCLCPP_INFO(node->get_logger(),
-            "[TS-DIAG] frame#%d | dev_raw=%lu ns | calib=%ld ns | dev-vs-now offset=%ld ns | "
-            "Chunk: sec=%lu cyc=%lu off=%lu | epoch_offset=%ld ns",
-            pFrameInfo->nFrameNum, dev_stamp, dev_stamp_ns,
-            (int64_t)(dev_stamp_ns - (uint64_t)now_ns),
-            chunk_sec, chunk_cyc, chunk_off,
-            epoch_offset_ns);
-    }
-
-    // ---- PTP/ChunkData 延迟测量: 计算 ΔT = T_exposure - T_send ----
-    uint64_t t_send_ns = node->pImpl->last_trigger_send_ns_.load();
-    if (t_send_ns > 0 && dev_stamp_ns > 0) {
-        int64_t delta_ns = (int64_t)(dev_stamp_ns - t_send_ns);
-        RCLCPP_INFO(node->get_logger(),
-            "[LATENCY] T_send=%lu T_exposure=%lu ΔT=%ld ns (%.1f μs)",
-            t_send_ns, dev_stamp_ns, delta_ns, delta_ns / 1000.0);
+    int64_t delta_ctrl_ns = 0;
+    int64_t delta_drv_ns = 0;
+    if (has_matched_trigger && ptp_time_valid) {
+        delta_ctrl_ns = static_cast<int64_t>(exposure_ns) - static_cast<int64_t>(matched_trigger.t_app_issue_ns);
+        delta_drv_ns = static_cast<int64_t>(exposure_ns) - static_cast<int64_t>(matched_trigger.t_drv_before_ns);
     }
 
     auto p_img_msg = std::make_unique<sensor_msgs::msg::Image>();
@@ -129,9 +215,9 @@ void HikvisionDriver::Impl::image_callback_ex(unsigned char *pData, MV_FRAME_OUT
         RCLCPP_ERROR_ONCE(node->get_logger(), "image bytes exceed max available size");
         return;
     }
-    p_img_msg->header.frame_id = node->pImpl->frame_id;
-    p_img_msg->header.stamp.nanosec = host_stamp % 1000ull * 1000000ull;
-    p_img_msg->header.stamp.sec = host_stamp / 1000ull;
+    p_img_msg->header.frame_id = impl.frame_id;
+    p_img_msg->header.stamp.nanosec = static_cast<uint32_t>(host_stamp % 1000ull) * 1000000ull;
+    p_img_msg->header.stamp.sec = static_cast<int32_t>(host_stamp / 1000ull);
     p_img_msg->is_bigendian = false;
     p_img_msg->width = pFrameInfo->nWidth;
     p_img_msg->height = pFrameInfo->nHeight;
@@ -157,10 +243,10 @@ void HikvisionDriver::Impl::image_callback_ex(unsigned char *pData, MV_FRAME_OUT
         p_img_msg->step = pFrameInfo->nWidth * 3;
         p_img_msg->encoding = sensor_msgs::image_encodings::BGR8;
     } else {
-        RCLCPP_ERROR_ONCE(node->get_logger(), "unsupport pixel format: %d", (int)pFrameInfo->enPixelType);
+        RCLCPP_ERROR_ONCE(node->get_logger(), "unsupport pixel format: %d", static_cast<int>(pFrameInfo->enPixelType));
         return;
     }
-    // 1. 检查长度并填充图像数据
+
     if (pFrameInfo->nFrameLen < (p_img_msg->height * p_img_msg->step)) {
         RCLCPP_ERROR(node->get_logger(), "nFrameLen < required data size, len=%d", pFrameInfo->nFrameLen);
         return;
@@ -168,28 +254,59 @@ void HikvisionDriver::Impl::image_callback_ex(unsigned char *pData, MV_FRAME_OUT
     p_img_msg->data.resize(p_img_msg->height * p_img_msg->step);
     std::copy_n(pData, p_img_msg->data.size(), p_img_msg->data.data());
 
-    // 2. 构造并发布自定义硬件 Info 消息
-    auto p_info_msg = std::make_unique<hikvision_interface::msg::HikImageInfo>();
-    p_info_msg->header.frame_id = node->pImpl->camera_name;
-    p_info_msg->header.stamp.nanosec = host_stamp % 1000ull * 1000000ull;
-    p_info_msg->header.stamp.sec = host_stamp / 1000ull;
-    p_info_msg->dev_stamp.nanosec = dev_stamp_ns % 1000000000ull;
-    p_info_msg->dev_stamp.sec = dev_stamp_ns / 1000000000ull;
+    auto p_info_msg = std::make_unique<HikImageInfo>();
+    p_info_msg->header.frame_id = impl.camera_name;
+    p_info_msg->header.stamp = p_img_msg->header.stamp;
+    p_info_msg->dev_stamp = ptp_time_valid ? ToBuiltinTime(exposure_ns) : builtin_interfaces::msg::Time();
     p_info_msg->frame_num = pFrameInfo->nFrameNum;
     p_info_msg->gain = pFrameInfo->fGain;
     p_info_msg->exposure = pFrameInfo->fExposureTime;
     p_info_msg->red = pFrameInfo->nRed;
     p_info_msg->green = pFrameInfo->nGreen;
     p_info_msg->blue = pFrameInfo->nBlue;
-    node->pImpl->p_info_pub->publish(std::move(p_info_msg));
+    p_info_msg->matched_trigger = has_matched_trigger;
+    p_info_msg->ptp_locked = ptp_locked;
+    p_info_msg->ptp_time_valid = ptp_time_valid;
+    p_info_msg->trigger_seq = has_matched_trigger ? matched_trigger.trigger_seq : 0;
+    p_info_msg->trigger_index = pFrameInfo->nTriggerIndex;
+    p_info_msg->t_app_issue = has_matched_trigger ? ToBuiltinTime(matched_trigger.t_app_issue_ns) : builtin_interfaces::msg::Time();
+    p_info_msg->t_drv_before = has_matched_trigger ? ToBuiltinTime(matched_trigger.t_drv_before_ns) : builtin_interfaces::msg::Time();
+    p_info_msg->t_drv_after = has_matched_trigger ? ToBuiltinTime(matched_trigger.t_drv_after_ns) : builtin_interfaces::msg::Time();
+    p_info_msg->delta_ctrl_ns = delta_ctrl_ns;
+    p_info_msg->delta_drv_ns = delta_drv_ns;
+    p_info_msg->dev_timestamp_ticks = dev_stamp_ticks;
+    p_info_msg->timestamp_tick_frequency = tick_frequency;
+    p_info_msg->chunk_second_count = pFrameInfo->nSecondCount;
+    p_info_msg->chunk_cycle_count = pFrameInfo->nCycleCount;
+    p_info_msg->chunk_cycle_offset = pFrameInfo->nCycleOffset;
 
-    // 3. 构造并发布 CameraInfo 消息
-    auto cam_info_msg = std::make_unique<sensor_msgs::msg::CameraInfo>(node->pImpl->cinfo_manager->getCameraInfo());
-    cam_info_msg->header = p_img_msg->header; // 先使用 p_img_msg 的数据
-    node->pImpl->camera_info_pub->publish(std::move(cam_info_msg));
+    if (has_matched_trigger) {
+        if (ptp_time_valid) {
+            RCLCPP_INFO(node->get_logger(),
+                        "[MATCH] seq=%lu frame=%u trig_idx=%u Δctrl=%.3f ms Δdrv=%.3f ms ptp=%s",
+                        matched_trigger.trigger_seq,
+                        pFrameInfo->nFrameNum,
+                        pFrameInfo->nTriggerIndex,
+                        delta_ctrl_ns / 1e6,
+                        delta_drv_ns / 1e6,
+                        PtpStatusToString(ptp_status));
+        } else {
+            RCLCPP_WARN(node->get_logger(),
+                        "[MATCH] seq=%lu frame=%u matched but PTP timestamp invalid (status=%s, tick_freq=%lu)",
+                        matched_trigger.trigger_seq,
+                        pFrameInfo->nFrameNum,
+                        PtpStatusToString(ptp_status),
+                        tick_frequency);
+        }
+    }
 
-    // 4. 【最后一步】发布 Image 消息 (一旦 move，p_img_msg 将失效)
-    node->pImpl->img_pub.publish(std::move(p_img_msg));
+    impl.p_info_pub->publish(std::move(p_info_msg));
+
+    auto cam_info_msg = std::make_unique<sensor_msgs::msg::CameraInfo>(impl.cinfo_manager->getCameraInfo());
+    cam_info_msg->header = p_img_msg->header;
+    impl.camera_info_pub->publish(std::move(cam_info_msg));
+
+    impl.img_pub.publish(std::move(p_img_msg));
 }
 
 HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
@@ -197,49 +314,38 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
     auto logger = get_logger();
     pImpl->logger = std::make_unique<rclcpp::Logger>(logger);
 
-    // 给定空字符串作为默认值，防止 as_string() 抛出异常
-    declare_parameter<std::string>("camera_name", ""); 
+    declare_parameter<std::string>("camera_name", "");
     pImpl->camera_name = get_parameter("camera_name").as_string();
-    
-    // 现在如果没传名字，这段友好的报错逻辑就能被完美触发了
     if (pImpl->camera_name.empty()) {
         RCLCPP_ERROR(logger, "Parameter 'camera_name' is empty! You must specify a valid camera name.");
         throw std::runtime_error("Parameter 'camera_name' is missing.");
     }
     RCLCPP_INFO(logger, "trying to open camera: '%s'", pImpl->camera_name.c_str());
 
-    // 声明 frame_id 和 camera_info_url
     declare_parameter<std::string>("frame_id", pImpl->camera_name);
     pImpl->frame_id = get_parameter("frame_id").as_string();
     declare_parameter<std::string>("camera_info_url", "");
 
-    // 新增：声明曝光和增益的动态参数（默认值：20000us 曝光，15dB 增益）
     declare_parameter<double>("exposure_time", 20000.0);
     declare_parameter<double>("gain", 15.0);
-
-    // 新增：像素格式可在配置文件中指定。
-    // "Keep" 表示不修改相机当前格式（由 MVS 客户端预先配置）；
-    // 也可指定 "RGB8" / "BGR8" / "Mono8" / "BayerRG8" / "BayerBG8" / "BayerGR8" / "BayerGB8"。
     declare_parameter<std::string>("pixel_format", "RGB8");
 
-    // 使用 RELIABLE QoS，确保与 rviz2 等默认订阅者兼容
     auto qos = rclcpp::SensorDataQoS().reliable();
     pImpl->img_pub = image_transport::create_publisher(this, "image_raw", qos.get_rmw_qos_profile());
     pImpl->p_info_pub = create_publisher<HikImageInfo>("info", qos);
-
     pImpl->camera_info_pub = create_publisher<sensor_msgs::msg::CameraInfo>("camera_info", qos);
     pImpl->cinfo_manager = std::make_shared<camera_info_manager::CameraInfoManager>(
         this, pImpl->camera_name, get_parameter("camera_info_url").as_string());
 
     MV_CC_DEVICE_INFO_LIST stDeviceList;
-    memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+    std::memset(&stDeviceList, 0, sizeof(stDeviceList));
     MV_CHECK_THROW(logger, MV_CC_EnumDevices, MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
 
     for (uint32_t nDeviceId = 0; nDeviceId < stDeviceList.nDeviceNum; nDeviceId++) {
         auto *pDeviceInfo = stDeviceList.pDeviceInfo[nDeviceId];
         const char *pUserDefinedName = nullptr;
         if (pDeviceInfo->nTLayerType == MV_GIGE_DEVICE) {
-            pUserDefinedName = (const char *)pDeviceInfo->SpecialInfo.stGigEInfo.chUserDefinedName;
+            pUserDefinedName = reinterpret_cast<const char *>(pDeviceInfo->SpecialInfo.stGigEInfo.chUserDefinedName);
             if (pUserDefinedName == pImpl->camera_name) {
                 int nIp1 = ((pDeviceInfo->SpecialInfo.stGigEInfo.nCurrentIp & 0xff000000) >> 24);
                 int nIp2 = ((pDeviceInfo->SpecialInfo.stGigEInfo.nCurrentIp & 0x00ff0000) >> 16);
@@ -249,7 +355,7 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
                             pDeviceInfo->SpecialInfo.stGigEInfo.chModelName, nIp1, nIp2, nIp3, nIp4);
             }
         } else if (pDeviceInfo->nTLayerType == MV_USB_DEVICE) {
-            pUserDefinedName = (const char *)pDeviceInfo->SpecialInfo.stUsb3VInfo.chUserDefinedName;
+            pUserDefinedName = reinterpret_cast<const char *>(pDeviceInfo->SpecialInfo.stUsb3VInfo.chUserDefinedName);
             if (pUserDefinedName == pImpl->camera_name) {
                 RCLCPP_INFO(logger, "[%s]: USB, %s", pUserDefinedName,
                             pDeviceInfo->SpecialInfo.stUsb3VInfo.chModelName);
@@ -257,156 +363,160 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
         } else {
             RCLCPP_WARN(logger, "type(%d) not support", pDeviceInfo->nTLayerType);
         }
-        if (pUserDefinedName == pImpl->camera_name) {
-            MV_CHECK_THROW(logger, MV_CC_CreateHandle, &pImpl->handle, pDeviceInfo);
-            MV_CHECK_THROW(logger, MV_CC_OpenDevice, pImpl->handle);
 
-            // ---- PTP/ChunkData 延迟测量: 启用 IEEE 1588 (PTP) 主时钟同步 ----
-            // 如果相机不支持此特性，只打印警告，不中断流程
-            {
-                int nRet = MV_CC_SetBoolValue(pImpl->handle, "GevIEEE1588", true);
-                if (MV_OK == nRet) {
-                    RCLCPP_INFO(logger, "GevIEEE1588 (PTP) enabled — camera clock will sync to host via ptp4l");
-                } else {
-                    RCLCPP_WARN(logger, "GevIEEE1588 not supported or failed (0x%X); PTP sync may need manual camera-side config", nRet);
-                }
-            }
-
-            // ---- PTP/ChunkData 延迟测量: 启用 ChunkData (Exposure + Timestamp) ----
-            {
-                int nRet = MV_CC_SetBoolValue(pImpl->handle, "ChunkModeActive", true);
-                if (MV_OK != nRet) {
-                    RCLCPP_WARN(logger, "ChunkModeActive failed (0x%X) — camera may not support ChunkData", nRet);
-                } else {
-                    // Chunk 1: Exposure time
-                    MV_CC_SetEnumValueByString(pImpl->handle, "ChunkSelector", "Exposure");
-                    MV_CC_SetBoolValue(pImpl->handle, "ChunkEnable", true);
-                    // Chunk 2: Timestamp (曝光时刻的时间戳)
-                    MV_CC_SetEnumValueByString(pImpl->handle, "ChunkSelector", "Timestamp");
-                    nRet = MV_CC_SetBoolValue(pImpl->handle, "ChunkEnable", true);
-                    if (MV_OK == nRet) {
-                        RCLCPP_INFO(logger, "ChunkData enabled: Exposure + Timestamp chunks active");
-                    } else {
-                        RCLCPP_WARN(logger, "ChunkData Timestamp enable failed (0x%X)", nRet);
-                    }
-                }
-            }
-
-            // 像素格式：根据 pixel_format 参数设置；"Keep" 时保持相机当前格式。
-            std::string pixel_format = get_parameter("pixel_format").as_string();
-            if (pixel_format != "Keep") {
-                static const std::map<std::string, MvGvspPixelType> kPixelFormatMap = {
-                    {"Mono8", PixelType_Gvsp_Mono8},         {"RGB8", PixelType_Gvsp_RGB8_Packed},
-                    {"BGR8", PixelType_Gvsp_BGR8_Packed},    {"BayerRG8", PixelType_Gvsp_BayerRG8},
-                    {"BayerBG8", PixelType_Gvsp_BayerBG8},   {"BayerGR8", PixelType_Gvsp_BayerGR8},
-                    {"BayerGB8", PixelType_Gvsp_BayerGB8},
-                };
-                auto it = kPixelFormatMap.find(pixel_format);
-                if (it == kPixelFormatMap.end()) {
-                    RCLCPP_WARN(logger, "unknown pixel_format '%s', keeping camera default", pixel_format.c_str());
-                } else {
-                    MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "PixelFormat", it->second);
-                }
-            }
-
-            // 初始化相机参数
-            double init_exposure = get_parameter("exposure_time").as_double();
-            double init_gain = get_parameter("gain").as_double();
-            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "ExposureAuto", 0); // 关闭自动曝光
-            MV_CHECK_THROW(logger, MV_CC_SetFloatValue, pImpl->handle, "ExposureTime", static_cast<float>(init_exposure));
-            MV_CHECK_THROW(logger, MV_CC_SetFloatValue, pImpl->handle, "Gain", static_cast<float>(init_gain));
-            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "BalanceWhiteAuto", 2); // 自动白平衡
-
-            // ==========================================================
-            // 触发模式 — 硬编码为 Software Trigger
-            // ==========================================================
-            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerMode", 1);   // TriggerMode = On
-            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerSource", 7); // TriggerSource = Software
-            RCLCPP_INFO(logger, "Trigger mode hardcoded ON (TriggerMode=On, TriggerSource=Software)");
-
-            // TriggerSoftware 服务：每次调用触发一次相机曝光
-            pImpl->trigger_service_ = this->create_service<std_srvs::srv::Trigger>(
-                "trigger_software",
-                [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
-                       std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
-                    // ---- PTP 延迟测量: 记录 T_send ----
-                    auto t_send = this->now();
-                    uint64_t t_send_ns = static_cast<uint64_t>(t_send.nanoseconds());
-                    pImpl->last_trigger_send_ns_.store(t_send_ns);
-
-                    int nRet = MV_CC_SetCommandValue(pImpl->handle, "TriggerSoftware");
-                    if (nRet == MV_OK) {
-                        res->success = true;
-                        // 将 T_send 编码到 message 中，方便调用方解析
-                        res->message = "ok|" + std::to_string(t_send_ns);
-                    } else {
-                        res->success = false;
-                        res->message = "TriggerSoftware failed: 0x" +
-                            (std::ostringstream{} << std::hex << nRet).str();
-                        RCLCPP_WARN(this->get_logger(), "TriggerSoftware failed: 0x%X", nRet);
-                    }
-                });
-            RCLCPP_INFO(logger, "TriggerSoftware service ready at '%s'",
-                       pImpl->trigger_service_->get_service_name());
-
-            // 新增：注册动态参数监听回调（实现实时滑块控制）
-            pImpl->param_callback_handle = this->add_on_set_parameters_callback(
-                [this, logger](const std::vector<rclcpp::Parameter> &parameters) {
-                    rcl_interfaces::msg::SetParametersResult result;
-                    result.successful = true;
-
-                    // 在设置前查询 SDK 的 [min, max] 并裁剪，越界值会被 SDK 直接拒绝。
-                    auto set_float = [&](const char *node_name, const char *unit, double value) {
-                        MVCC_FLOATVALUE range;
-                        memset(&range, 0, sizeof(range));
-                        int ret = MV_CC_GetFloatValue(pImpl->handle, node_name, &range);
-                        if (ret != MV_OK) {
-                            result.successful = false;
-                            result.reason = std::string("Failed to query range for ") + node_name;
-                            return;
-                        }
-                        float val = static_cast<float>(value);
-                        if (val < range.fMin || val > range.fMax) {
-                            result.successful = false;
-                            result.reason = std::string(node_name) + " out of range [" +
-                                            std::to_string(range.fMin) + ", " + std::to_string(range.fMax) + "]";
-                            RCLCPP_WARN(logger, "%s %.1f %s out of range [%.1f, %.1f]", node_name, val, unit,
-                                        range.fMin, range.fMax);
-                            return;
-                        }
-                        ret = MV_CC_SetFloatValue(pImpl->handle, node_name, val);
-                        if (ret == MV_OK) {
-                            RCLCPP_INFO(logger, "Dynamically set %s to: %.1f %s", node_name, val, unit);
-                        } else {
-                            result.successful = false;
-                            result.reason = std::string("Failed to set ") + node_name + " via SDK";
-                        }
-                    };
-
-                    for (const auto &param : parameters) {
-                        if (param.get_name() == "exposure_time") {
-                            set_float("ExposureTime", "us", param.as_double());
-                        } else if (param.get_name() == "gain") {
-                            set_float("Gain", "dB", param.as_double());
-                        }
-                    }
-                    return result;
-                }
-            );
-
-            MV_CHECK_THROW(logger, MV_CC_RegisterImageCallBackEx, pImpl->handle, &HikvisionDriver::Impl::image_callback_ex,
-                     this);
-            MV_CHECK_THROW(logger, MV_CC_StartGrabbing, pImpl->handle);
-            break;
+        if (pUserDefinedName != pImpl->camera_name) {
+            continue;
         }
+
+        MV_CHECK_THROW(logger, MV_CC_CreateHandle, &pImpl->handle, pDeviceInfo);
+        MV_CHECK_THROW(logger, MV_CC_OpenDevice, pImpl->handle);
+
+        {
+            int nRet = MV_CC_SetBoolValue(pImpl->handle, "GevIEEE1588", true);
+            if (MV_OK == nRet) {
+                RCLCPP_INFO(logger, "GevIEEE1588 (PTP) enabled");
+            } else {
+                RCLCPP_WARN(logger, "GevIEEE1588 not supported or failed (0x%X)", nRet);
+            }
+        }
+
+        {
+            int nRet = MV_CC_SetBoolValue(pImpl->handle, "ChunkModeActive", true);
+            if (MV_OK != nRet) {
+                RCLCPP_WARN(logger, "ChunkModeActive failed (0x%X) — camera may not support ChunkData", nRet);
+            } else {
+                MV_CC_SetEnumValueByString(pImpl->handle, "ChunkSelector", "Exposure");
+                MV_CC_SetBoolValue(pImpl->handle, "ChunkEnable", true);
+                MV_CC_SetEnumValueByString(pImpl->handle, "ChunkSelector", "Timestamp");
+                nRet = MV_CC_SetBoolValue(pImpl->handle, "ChunkEnable", true);
+                if (MV_OK == nRet) {
+                    RCLCPP_INFO(logger, "ChunkData enabled: Exposure + Timestamp chunks active");
+                } else {
+                    RCLCPP_WARN(logger, "ChunkData Timestamp enable failed (0x%X)", nRet);
+                }
+            }
+        }
+
+        std::string pixel_format = get_parameter("pixel_format").as_string();
+        if (pixel_format != "Keep") {
+            static const std::map<std::string, MvGvspPixelType> kPixelFormatMap = {
+                {"Mono8", PixelType_Gvsp_Mono8},       {"RGB8", PixelType_Gvsp_RGB8_Packed},
+                {"BGR8", PixelType_Gvsp_BGR8_Packed},  {"BayerRG8", PixelType_Gvsp_BayerRG8},
+                {"BayerBG8", PixelType_Gvsp_BayerBG8}, {"BayerGR8", PixelType_Gvsp_BayerGR8},
+                {"BayerGB8", PixelType_Gvsp_BayerGB8},
+            };
+            auto it = kPixelFormatMap.find(pixel_format);
+            if (it == kPixelFormatMap.end()) {
+                RCLCPP_WARN(logger, "unknown pixel_format '%s', keeping camera default", pixel_format.c_str());
+            } else {
+                MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "PixelFormat", it->second);
+            }
+        }
+
+        double init_exposure = get_parameter("exposure_time").as_double();
+        double init_gain = get_parameter("gain").as_double();
+        MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "ExposureAuto", 0);
+        MV_CHECK_THROW(logger, MV_CC_SetFloatValue, pImpl->handle, "ExposureTime", static_cast<float>(init_exposure));
+        MV_CHECK_THROW(logger, MV_CC_SetFloatValue, pImpl->handle, "Gain", static_cast<float>(init_gain));
+        MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "BalanceWhiteAuto", 2);
+
+        MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerMode", 1);
+        MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerSource", 7);
+        RCLCPP_INFO(logger, "Trigger mode hardcoded ON (TriggerMode=On, TriggerSource=Software)");
+
+        pImpl->refresh_ptp_state(logger, true);
+
+        pImpl->trigger_service_ = this->create_service<TriggerSoftwareStamped>(
+            "trigger_software",
+            [this](const std::shared_ptr<TriggerSoftwareStamped::Request> req,
+                   std::shared_ptr<TriggerSoftwareStamped::Response> res) {
+                uint64_t t_drv_before_ns = static_cast<uint64_t>(this->now().nanoseconds());
+                int nRet = MV_CC_SetCommandValue(pImpl->handle, "TriggerSoftware");
+                uint64_t t_drv_after_ns = static_cast<uint64_t>(this->now().nanoseconds());
+
+                res->t_drv_before_ns = t_drv_before_ns;
+                res->t_drv_after_ns = t_drv_after_ns;
+
+                if (nRet == MV_OK) {
+                    Impl::PendingTrigger pending;
+                    {
+                        std::lock_guard<std::mutex> lk(pImpl->trigger_mtx_);
+                        pending.trigger_seq = pImpl->next_trigger_seq_++;
+                        pending.t_app_issue_ns = req->t_app_issue_ns;
+                        pending.t_drv_before_ns = t_drv_before_ns;
+                        pending.t_drv_after_ns = t_drv_after_ns;
+                        pImpl->pending_triggers_.push_back(pending);
+                    }
+
+                    res->success = true;
+                    res->message = "ok";
+                    res->trigger_seq = pending.trigger_seq;
+                } else {
+                    res->success = false;
+                    res->message = "TriggerSoftware failed";
+                    res->trigger_seq = 0;
+                    RCLCPP_WARN(this->get_logger(), "TriggerSoftware failed: 0x%X", nRet);
+                }
+            });
+        RCLCPP_INFO(logger, "TriggerSoftware service ready at '%s'",
+                    pImpl->trigger_service_->get_service_name());
+
+        pImpl->param_callback_handle = this->add_on_set_parameters_callback(
+            [this, logger](const std::vector<rclcpp::Parameter> &parameters) {
+                rcl_interfaces::msg::SetParametersResult result;
+                result.successful = true;
+
+                auto set_float = [&](const char *node_name, const char *unit, double value) {
+                    MVCC_FLOATVALUE range;
+                    std::memset(&range, 0, sizeof(range));
+                    int ret = MV_CC_GetFloatValue(pImpl->handle, node_name, &range);
+                    if (ret != MV_OK) {
+                        result.successful = false;
+                        result.reason = std::string("Failed to query range for ") + node_name;
+                        return;
+                    }
+                    float val = static_cast<float>(value);
+                    if (val < range.fMin || val > range.fMax) {
+                        result.successful = false;
+                        result.reason = std::string(node_name) + " out of range [" +
+                                        std::to_string(range.fMin) + ", " + std::to_string(range.fMax) + "]";
+                        RCLCPP_WARN(logger, "%s %.1f %s out of range [%.1f, %.1f]",
+                                    node_name, val, unit, range.fMin, range.fMax);
+                        return;
+                    }
+                    ret = MV_CC_SetFloatValue(pImpl->handle, node_name, val);
+                    if (ret == MV_OK) {
+                        RCLCPP_INFO(logger, "Dynamically set %s to: %.1f %s", node_name, val, unit);
+                    } else {
+                        result.successful = false;
+                        result.reason = std::string("Failed to set ") + node_name + " via SDK";
+                    }
+                };
+
+                for (const auto &param : parameters) {
+                    if (param.get_name() == "exposure_time") {
+                        set_float("ExposureTime", "us", param.as_double());
+                    } else if (param.get_name() == "gain") {
+                        set_float("Gain", "dB", param.as_double());
+                    }
+                }
+                return result;
+            });
+
+        MV_CHECK_THROW(logger, MV_CC_RegisterImageCallBackEx, pImpl->handle, &HikvisionDriver::Impl::image_callback_ex, this);
+        MV_CHECK_THROW(logger, MV_CC_StartGrabbing, pImpl->handle);
+        break;
     }
+
     if (pImpl->handle == nullptr) {
         RCLCPP_ERROR(logger, "camera '%s' not found", pImpl->camera_name.c_str());
     }
 }
 
 HikvisionDriver::~HikvisionDriver() {
-    if (pImpl->handle == nullptr) return;
+    if (pImpl->handle == nullptr) {
+        return;
+    }
     auto logger = get_logger();
 
     MV_CHECK_WARN(logger, MV_CC_StopGrabbing, pImpl->handle);
@@ -418,4 +528,4 @@ HikvisionDriver::~HikvisionDriver() {
 }  // namespace hikvision_driver
 
 #include "rclcpp_components/register_node_macro.hpp"
-RCLCPP_COMPONENTS_REGISTER_NODE(hikvision_driver::HikvisionDriver);
+RCLCPP_COMPONENTS_REGISTER_NODE(hikvision_driver::HikvisionDriver)
