@@ -113,8 +113,11 @@ struct HikvisionDriver::Impl {
     std::atomic<unsigned int> ptp_status_{2};
     std::atomic<uint64_t> timestamp_tick_frequency_{0};
     std::atomic<uint32_t> frame_counter_{0};
-    std::atomic<int64_t> ptp_to_unix_offset_ns_{0};
-    std::atomic<bool> ptp_offset_ready_{false};
+    // Two-point frequency calibration
+    std::atomic<int64_t> ref_dev_ticks_{0};
+    std::atomic<int64_t> ref_host_ns_{0};
+    std::atomic<uint64_t> calibrated_tick_freq_{0};
+    std::atomic<bool> freq_calibrated_{false};
 
     bool query_ptp_status(unsigned int &status) const {
         MVCC_ENUMVALUE value;
@@ -180,16 +183,37 @@ void HikvisionDriver::Impl::image_callback_ex(unsigned char *pData, MV_FRAME_OUT
     uint64_t exposure_ns = 0;
     bool ptp_time_valid = false;
     if (ptp_locked && tick_frequency > 0 && dev_stamp_ticks > 0) {
-        int64_t raw_ns = static_cast<int64_t>(ScaleTicksToNs(dev_stamp_ticks, tick_frequency));
-        if (!impl.ptp_offset_ready_.load()) {
+        if (!impl.freq_calibrated_.load()) {
+            // Two-point frequency calibration: camera-reported tick_frequency may be wrong.
+            // Measure the real frequency from the ratio of camera ticks to host time.
             int64_t host_ns = static_cast<int64_t>(host_stamp) * 1000000ll;
-            int64_t offset = host_ns - raw_ns;
-            impl.ptp_to_unix_offset_ns_.store(offset);
-            impl.ptp_offset_ready_.store(true);
-            RCLCPP_INFO(node->get_logger(), "PTP epoch offset = %ld ns (%.3f s)", offset, offset / 1e9);
+            if (impl.ref_dev_ticks_.load() == 0) {
+                impl.ref_dev_ticks_.store(static_cast<int64_t>(dev_stamp_ticks));
+                impl.ref_host_ns_.store(host_ns);
+            } else {
+                int64_t delta_ticks = static_cast<int64_t>(dev_stamp_ticks) - impl.ref_dev_ticks_.load();
+                int64_t delta_host_ns = host_ns - impl.ref_host_ns_.load();
+                if (delta_host_ns > 5'000'000'000ll) {  // ≥5s baseline for <0.04% freq error
+                    uint64_t cal_freq = static_cast<uint64_t>(
+                        static_cast<double>(delta_ticks) * 1'000'000'000.0 / delta_host_ns);
+                    impl.calibrated_tick_freq_.store(cal_freq);
+                    impl.freq_calibrated_.store(true);
+                    RCLCPP_INFO(node->get_logger(),
+                        "PTP freq calibrated: %lu Hz (reported %lu Hz, err %.1f%%)",
+                        cal_freq, tick_frequency,
+                        (static_cast<double>(cal_freq) / tick_frequency - 1.0) * 100.0);
+                }
+            }
         }
-        exposure_ns = static_cast<uint64_t>(raw_ns + impl.ptp_to_unix_offset_ns_.load());
-        ptp_time_valid = true;
+        if (impl.freq_calibrated_.load()) {
+            int64_t ref_ticks = impl.ref_dev_ticks_.load();
+            int64_t ref_host = impl.ref_host_ns_.load();
+            uint64_t freq = impl.calibrated_tick_freq_.load();
+            __int128 scaled = static_cast<__int128>(static_cast<int64_t>(dev_stamp_ticks) - ref_ticks) * 1'000'000'000ll;
+            int64_t raw_ns = ref_host + static_cast<int64_t>(scaled / freq);
+            exposure_ns = static_cast<uint64_t>(raw_ns);
+            ptp_time_valid = true;
+        }
     }
 
     Impl::PendingTrigger matched_trigger;
