@@ -11,6 +11,10 @@
     # 可选: "RGB8", "BGR8", "Mono8", "BayerRG8", "BayerBG8", "BayerGR8", "BayerGB8"
     pixel_format: "Keep"
 
+    # continuous: 连续出图
+    # software: 等待 trigger_software 服务触发
+    trigger_mode: "software"
+
     # 相机标定文件路径 (URI格式)
 
     camera_info_url: "package://hikvision_driver/config/camera_info.yaml"

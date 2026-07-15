@@ -94,6 +94,7 @@ struct HikvisionDriver::Impl {
 
     void *handle = nullptr;
     std::string camera_name;
+    bool software_trigger_enabled = true;
     image_transport::Publisher img_pub;
     std::shared_ptr<rclcpp::Publisher<HikImageInfo>> p_info_pub;
     static void image_callback_ex(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo, void *pUser);
@@ -353,6 +354,7 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
     declare_parameter<double>("exposure_time", 20000.0);
     declare_parameter<double>("gain", 15.0);
     declare_parameter<std::string>("pixel_format", "RGB8");
+    declare_parameter<std::string>("trigger_mode", "software");
 
     auto qos = rclcpp::SensorDataQoS().reliable();
     pImpl->img_pub = image_transport::create_publisher(this, "image_raw", qos.get_rmw_qos_profile());
@@ -443,10 +445,22 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
         MV_CHECK_THROW(logger, MV_CC_SetFloatValue, pImpl->handle, "ExposureTime", static_cast<float>(init_exposure));
         MV_CHECK_THROW(logger, MV_CC_SetFloatValue, pImpl->handle, "Gain", static_cast<float>(init_gain));
         MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "BalanceWhiteAuto", 2);
+        MV_CHECK_WARN(logger, MV_CC_SetEnumValueByString, pImpl->handle, "AcquisitionMode", "Continuous");
 
-        MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerMode", 1);
-        MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerSource", 7);
-        RCLCPP_INFO(logger, "Trigger mode hardcoded ON (TriggerMode=On, TriggerSource=Software)");
+        std::string trigger_mode = get_parameter("trigger_mode").as_string();
+        if (trigger_mode == "software") {
+            pImpl->software_trigger_enabled = true;
+            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerMode", 1);
+            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerSource", 7);
+            RCLCPP_INFO(logger, "Trigger mode: software (TriggerMode=On, TriggerSource=Software)");
+        } else if (trigger_mode == "continuous") {
+            pImpl->software_trigger_enabled = false;
+            MV_CHECK_THROW(logger, MV_CC_SetEnumValue, pImpl->handle, "TriggerMode", 0);
+            RCLCPP_INFO(logger, "Trigger mode: continuous (TriggerMode=Off)");
+        } else {
+            RCLCPP_ERROR(logger, "Invalid trigger_mode '%s'. Use 'software' or 'continuous'.", trigger_mode.c_str());
+            throw std::runtime_error("Invalid trigger_mode parameter");
+        }
 
         pImpl->refresh_ptp_state(logger, true);
 
@@ -454,6 +468,16 @@ HikvisionDriver::HikvisionDriver(const rclcpp::NodeOptions &options)
             "trigger_software",
             [this](const std::shared_ptr<TriggerSoftwareStamped::Request> req,
                    std::shared_ptr<TriggerSoftwareStamped::Response> res) {
+                if (!pImpl->software_trigger_enabled) {
+                    res->success = false;
+                    res->message = "trigger_mode is continuous; software trigger is disabled";
+                    res->trigger_seq = 0;
+                    res->t_drv_before_ns = 0;
+                    res->t_drv_after_ns = 0;
+                    RCLCPP_WARN(this->get_logger(), "Ignoring TriggerSoftware request while trigger_mode=continuous");
+                    return;
+                }
+
                 uint64_t t_drv_before_ns = static_cast<uint64_t>(this->now().nanoseconds());
                 int nRet = MV_CC_SetCommandValue(pImpl->handle, "TriggerSoftware");
                 uint64_t t_drv_after_ns = static_cast<uint64_t>(this->now().nanoseconds());
